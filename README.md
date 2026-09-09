@@ -5,8 +5,7 @@ at sunset. One self-contained HTML file, no build step.
 
 **[See it running →](https://cmillsap.github.io/Murmuration/)**
 
-![Thousands of starlings wheeling in front of the setting sun, above a castle
-silhouetted on a hilltop](screenshot.jpg)
+![Thousands of starlings wheeling in front of the setting sun, above a castle silhouetted on a hilltop](screenshot.jpg)
 
 Built with three.js r160.
 
