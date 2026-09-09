@@ -1,0 +1,1644 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Murmuration</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #14121a; overflow: hidden; }
+  canvas { display: block; }
+  body { font: 12px/1.5 ui-sans-serif, system-ui, "Segoe UI", sans-serif; color: #f2e6d8; }
+
+  #hint {
+    position: fixed; left: 14px; bottom: 12px; opacity: .55;
+    letter-spacing: .04em; text-shadow: 0 1px 3px rgba(0,0,0,.7);
+    pointer-events: none; transition: opacity .6s;
+  }
+  #hint.faded { opacity: .18; }
+
+  #ui {
+    position: fixed; top: 12px; right: 12px; width: 232px;
+    background: rgba(18,16,24,.82); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,.12); border-radius: 10px;
+    padding: 12px 14px 14px; display: none;
+    box-shadow: 0 8px 32px rgba(0,0,0,.45);
+  }
+  #ui.open { display: block; }
+  #ui h2 { margin: 0 0 10px; font-size: 11px; letter-spacing: .16em;
+           text-transform: uppercase; opacity: .6; font-weight: 600; }
+  #ui label { display: block; margin: 9px 0 2px; opacity: .8; }
+  #ui label span { float: right; opacity: .65; font-variant-numeric: tabular-nums; }
+  #ui input[type=range] { width: 100%; margin: 0; accent-color: #ff9a4c; }
+  #ui select { width: 100%; background: #262230; color: inherit; font: inherit;
+               border: 1px solid rgba(255,255,255,.15); border-radius: 5px; padding: 3px 5px; }
+  #ui .row { display: flex; gap: 14px; margin-top: 11px; }
+  #ui .row label { margin: 0; display: flex; align-items: center; gap: 5px; }
+  #ui .keys { margin-top: 12px; padding-top: 10px; opacity: .5; font-size: 11px;
+              border-top: 1px solid rgba(255,255,255,.1); }
+  #ui .keys b { font-weight: 600; opacity: .9; }
+  #stats { margin-top: 10px; opacity: .55; font-variant-numeric: tabular-nums; }
+
+  #fail { position: fixed; inset: 0; display: none; place-items: center; text-align: center;
+          padding: 40px; font-size: 14px; line-height: 1.8; }
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="hint">drag to look &middot; scroll to zoom &middot; <b>H</b> for controls</div>
+
+<div id="ui">
+  <h2>Murmuration</h2>
+
+  <label>Flock size <span id="v-tier"></span></label>
+  <select id="tier">
+    <option value="32">1,024 birds</option>
+    <option value="64" selected>4,096 birds</option>
+    <option value="96">9,216 birds</option>
+    <option value="128">16,384 birds</option>
+  </select>
+
+  <label>Separation <span id="v-sep"></span></label>
+  <input type="range" id="sep" min="0" max="6" step="0.05" value="2.6">
+
+  <label>Alignment <span id="v-ali"></span></label>
+  <input type="range" id="ali" min="0" max="4" step="0.05" value="1.35">
+
+  <label>Cohesion <span id="v-coh"></span></label>
+  <input type="range" id="coh" min="0" max="4" step="0.05" value="0.95">
+
+  <label>Orbit speed <span id="v-orb"></span></label>
+  <input type="range" id="orb" min="0" max="3" step="0.05" value="1">
+
+  <div class="row">
+    <label><input type="checkbox" id="pred" checked> Falcon</label>
+    <label><input type="checkbox" id="bloom" checked> Bloom</label>
+  </div>
+
+  <div id="stats">&mdash;</div>
+  <div class="keys"><b>H</b> panel &nbsp; <b>B</b> building &nbsp; <b>P</b> pause</div>
+</div>
+
+<div id="fail"></div>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ══════════════════════════════════════════════════════════════════════
+   1. CONFIG
+   ══════════════════════════════════════════════════════════════════════ */
+
+const CFG = {
+  tier: 64,                 // data texture width; birds = tier²
+  samples: 1024,            // neighbours inspected per bird per frame
+  birdScale: 1.35,
+
+  // flocking
+  sepDist: 9.0,  aliDist: 22.0, coh1Dist: 44.0,
+  sepW: 2.6,     aliW: 1.35,    cohW: 0.95,
+  minSpeed: 26.0, maxSpeed: 48.0, maxTurn: 2.9,
+
+  // where the flock lives
+  roostY: 262, roostSwing: 70, floorBase: 58, floorDome: 165, ceil: 435,
+
+  predator: true,
+  bloom: true,
+  paused: false,
+  orbitSpeed: 1.0,
+};
+
+const PLATEAU_Y = 116;                     // height of the flattened hilltop
+const HILL_R    = 125;                     // gaussian sigma of the hill dome
+const DOME_H    = 118;                     // peak of the underlying dome
+const SUN_ELEV  = THREE.MathUtils.degToRad(10.0);
+const SUN_AZIM  = THREE.MathUtils.degToRad(-24);
+
+const SUN_DIR = new THREE.Vector3(
+  Math.cos(SUN_ELEV) * Math.sin(SUN_AZIM),
+  Math.sin(SUN_ELEV),
+  Math.cos(SUN_ELEV) * Math.cos(SUN_AZIM),
+).normalize();
+
+// All THREE.Color values are converted to linear working space on assignment,
+// so these can be authored as ordinary sRGB hex.
+const COL = {
+  zenith:  new THREE.Color(0x27356b),
+  mid:     new THREE.Color(0x8a6f92),
+  horizon: new THREE.Color(0xf5a45c),
+  below:   new THREE.Color(0xc47a52),   // matches the fog, so the far terrain
+                                        // edge dissolves into the sky
+
+  sunGlow: new THREE.Color(0xff8c34),
+  sunCore: new THREE.Color(0xfff3d0),
+  fog:     new THREE.Color(0xc47a52),
+  cloudLit:  new THREE.Color(0xffd3a0),
+  cloudDark: new THREE.Color(0x52465e),
+  birdDark: new THREE.Color(0x0b0910),
+  birdLit:  new THREE.Color(0x5c4437),
+};
+const FOG_DENSITY = 0.00072;
+
+/* ══════════════════════════════════════════════════════════════════════
+   2. RENDERER / SCENE / CAMERA
+   ══════════════════════════════════════════════════════════════════════ */
+
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+} catch (e) {
+  bail('This scene needs WebGL, which this browser did not provide.');
+}
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.95;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(COL.fog.clone(), FOG_DENSITY);
+
+const camera = new THREE.PerspectiveCamera(52, window.innerWidth / window.innerHeight, 0.5, 14000);
+camera.position.set(0, 150, 340);
+
+// Float render targets are needed for the flocking state; half-float loses too
+// much precision at these world coordinates.
+const glCtx = renderer.getContext();
+const CAN_FLOAT = renderer.capabilities.isWebGL2
+  ? !!glCtx.getExtension('EXT_color_buffer_float')
+  : !!glCtx.getExtension('OES_texture_float');
+const DATA_TYPE = CAN_FLOAT ? THREE.FloatType : THREE.HalfFloatType;
+
+/* ══════════════════════════════════════════════════════════════════════
+   3. NOISE (shared by terrain and cloud texture)
+   ══════════════════════════════════════════════════════════════════════ */
+
+function hash2(x, y) {
+  let h = x * 374761393 + y * 668265263;
+  h = (h ^ (h >> 13)) * 1274126177;
+  return ((h ^ (h >> 16)) >>> 0) / 4294967295;
+}
+const fade = t => t * t * (3 - 2 * t);
+
+function valueNoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = fade(xf), v = fade(yf);
+  const a = hash2(xi, yi),     b = hash2(xi + 1, yi);
+  const c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+}
+
+function fbm(x, y, octaves) {
+  let sum = 0, amp = 0.5, norm = 0;
+  for (let i = 0; i < octaves; i++) {
+    sum += amp * valueNoise(x, y);
+    norm += amp;
+    x *= 2.03; y *= 2.01; amp *= 0.5;
+  }
+  return sum / norm;
+}
+
+const smoothstep = (e0, e1, x) => {
+  const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
+  return t * t * (3 - 2 * t);
+};
+
+/* ══════════════════════════════════════════════════════════════════════
+   4. SKY + SUN
+   ══════════════════════════════════════════════════════════════════════ */
+
+const skyUniforms = {
+  uSunDir:   { value: SUN_DIR },
+  uZenith:   { value: COL.zenith },
+  uMid:      { value: COL.mid },
+  uHorizon:  { value: COL.horizon },
+  uBelow:    { value: COL.below },
+  uSunGlow:  { value: COL.sunGlow },
+  uSunCore:  { value: COL.sunCore },
+};
+
+const skyMat = new THREE.ShaderMaterial({
+  uniforms: skyUniforms,
+  side: THREE.BackSide,
+  depthWrite: false,
+  fog: false,
+  vertexShader: /* glsl */`
+    varying vec3 vDir;
+    void main() {
+      vDir = position;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    uniform vec3 uSunDir, uZenith, uMid, uHorizon, uBelow, uSunGlow, uSunCore;
+    varying vec3 vDir;
+
+    void main() {
+      vec3 dir = normalize(vDir);
+      float h = dir.y;
+
+      // vertical banding: zenith -> mid -> warm horizon -> dark below
+      vec3 col = mix(uMid, uZenith, smoothstep(0.06, 0.62, h));
+      col = mix(col, uHorizon, smoothstep(0.20, -0.015, h));
+      col = mix(col, uBelow,   smoothstep(0.008, -0.045, h));
+
+      float sd = max(dot(dir, uSunDir), 0.0);
+
+      // broad forward scatter, warming the whole sunward half of the sky,
+      // strongest near the horizon where the air path is longest
+      float lowAir = 1.0 - smoothstep(0.0, 0.55, max(h, 0.0));
+      col += uSunGlow * pow(sd, 3.0)  * 0.30 * lowAir;
+      col += uSunGlow * pow(sd, 24.0) * 0.85;
+      col += uSunGlow * pow(sd, 260.0) * 2.2;
+
+      // the disc itself, pushed well above 1.0 so bloom has something to grab
+      float disc = smoothstep(0.99955, 0.99975, sd);
+      col = mix(col, uSunCore * 3.4, disc);
+
+      // ordered-ish dither, otherwise the gradient bands badly on 8-bit output
+      float d = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+      col += (d - 0.5) * 0.004;
+
+      gl_FragColor = vec4(col, 1.0);
+      #include <tonemapping_fragment>
+      #include <colorspace_fragment>
+    }
+  `,
+});
+
+const sky = new THREE.Mesh(new THREE.SphereGeometry(6000, 48, 32), skyMat);
+sky.frustumCulled = false;
+sky.renderOrder = -1000;
+scene.add(sky);
+
+/* ══════════════════════════════════════════════════════════════════════
+   5. CLOUDS
+   ══════════════════════════════════════════════════════════════════════ */
+
+function makePuffTexture(size = 128) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = size;
+  const ctx = cv.getContext('2d');
+  const img = ctx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = (x + 0.5) / size - 0.5, dy = (y + 0.5) / size - 0.5;
+      const d = Math.hypot(dx, dy) * 2.0;                 // 0 centre .. 1 edge
+      let a = Math.pow(Math.max(0, 1 - d), 1.5);
+      a *= 0.55 + 0.85 * fbm(x * 0.055, y * 0.055, 4);    // puffy, uneven edge
+      a *= smoothstep(1.0, 0.62, d);                      // hard cut at the rim
+      const i = (y * size + x) * 4;
+      img.data[i] = img.data[i + 1] = img.data[i + 2] = 255;
+      img.data[i + 3] = Math.round(255 * Math.min(1, Math.max(0, a)));
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  return tex;
+}
+
+const cloudGroup = new THREE.Group();
+scene.add(cloudGroup);
+
+const cloudUniforms = {
+  uMap:     { value: makePuffTexture() },
+  uSunDir:  { value: SUN_DIR },
+  uLit:     { value: COL.cloudLit },
+  uDark:    { value: COL.cloudDark },
+  uGlow:    { value: COL.sunGlow },
+  uFogCol:  { value: COL.fog },
+  uFogDen:  { value: FOG_DENSITY },
+  uTime:    { value: 0 },
+};
+
+function buildClouds() {
+  const CLUSTERS = 58;
+  const puffs = [];
+
+  for (let c = 0; c < CLUSTERS; c++) {
+    const ang = Math.random() * Math.PI * 2;
+    const rad = 700 + Math.random() * 2400;
+    const cx = Math.cos(ang) * rad, cz = Math.sin(ang) * rad;
+    const cy = 230 + Math.random() * 520;
+    const spreadX = 130 + Math.random() * 260;
+    const spreadY = 40 + Math.random() * 55;
+    const n = 22 + (Math.random() * 34 | 0);
+
+    for (let p = 0; p < n; p++) {
+      // biased toward the cluster centre so clusters have a dense core
+      const t = Math.pow(Math.random(), 0.6);
+      const a = Math.random() * Math.PI * 2;
+      const ox = Math.cos(a) * t * spreadX;
+      const oz = (Math.random() - 0.5) * 2 * t * spreadX * 0.7;
+      const oy = (Math.random() - 0.5) * 2 * t * spreadY;
+      puffs.push({
+        x: cx + ox, y: cy + oy, z: cz + oz,
+        dx: ox / spreadX, dy: oy / spreadY * 0.6, dz: oz / spreadX,
+        size: (90 + Math.random() * 130) * (1.25 - 0.45 * t),
+        alpha: 0.30 + Math.random() * 0.30,
+      });
+    }
+  }
+
+  const N = puffs.length;
+  const geo = new THREE.InstancedBufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(
+    [-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0], 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
+  geo.setIndex([0, 1, 2, 0, 2, 3]);
+
+  const off = new Float32Array(N * 3);
+  const dir = new Float32Array(N * 3);
+  const sz  = new Float32Array(N);
+  const al  = new Float32Array(N);
+  puffs.forEach((p, i) => {
+    off[i * 3] = p.x; off[i * 3 + 1] = p.y; off[i * 3 + 2] = p.z;
+    dir[i * 3] = p.dx; dir[i * 3 + 1] = p.dy; dir[i * 3 + 2] = p.dz;
+    sz[i] = p.size; al[i] = p.alpha;
+  });
+  geo.setAttribute('iOffset', new THREE.InstancedBufferAttribute(off, 3));
+  geo.setAttribute('iDir',    new THREE.InstancedBufferAttribute(dir, 3));
+  geo.setAttribute('iSize',   new THREE.InstancedBufferAttribute(sz, 1));
+  geo.setAttribute('iAlpha',  new THREE.InstancedBufferAttribute(al, 1));
+  geo.instanceCount = N;
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms: cloudUniforms,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    vertexShader: /* glsl */`
+      attribute vec3 iOffset;
+      attribute vec3 iDir;
+      attribute float iSize;
+      attribute float iAlpha;
+      varying vec2 vUv;
+      varying vec3 vDir;
+      varying vec3 vView;
+      varying float vAlpha;
+      varying float vFogDepth;
+
+      void main() {
+        vUv = uv;
+        vAlpha = iAlpha;
+        vec4 worldCentre = modelMatrix * vec4(iOffset, 1.0);
+        vDir = normalize(mat3(modelMatrix) * (iDir + vec3(0.0, 0.001, 0.0)));
+
+        // billboard: camera right/up straight out of the view matrix
+        vec3 right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
+        vec3 up    = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
+        vec3 world = worldCentre.xyz + (right * position.x + up * position.y) * iSize;
+
+        vView = normalize(world - cameraPosition);
+        vec4 mv = viewMatrix * vec4(world, 1.0);
+        vFogDepth = -mv.z;
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */`
+      precision highp float;
+      uniform sampler2D uMap;
+      uniform vec3 uSunDir, uLit, uDark, uGlow, uFogCol;
+      uniform float uFogDen;
+      varying vec2 vUv;
+      varying vec3 vDir;
+      varying vec3 vView;
+      varying float vAlpha;
+      varying float vFogDepth;
+
+      void main() {
+        float a = texture2D(uMap, vUv).a * vAlpha;
+        if (a < 0.004) discard;
+
+        // cheap single-scatter: puffs on the sun side of their cluster are lit
+        float lit = smoothstep(-0.55, 0.75, dot(vDir, uSunDir));
+        vec3 col = mix(uDark, uLit, lit);
+
+        // silver lining when looking through the cloud toward the sun
+        float fwd = max(dot(vView, uSunDir), 0.0);
+        col += uGlow * pow(fwd, 7.0) * (0.35 + 0.65 * (1.0 - a));
+
+        float f = 1.0 - exp(-uFogDen * uFogDen * vFogDepth * vFogDepth);
+        col = mix(col, uFogCol, f);
+
+        gl_FragColor = vec4(col, a);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 10;
+  cloudGroup.add(mesh);
+}
+buildClouds();
+
+// high cirrus sheet
+function buildCirrus() {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uSunDir: { value: SUN_DIR },
+      uWarm:   { value: COL.horizon },
+      uCool:   { value: COL.mid },
+      uGlow:   { value: COL.sunGlow },
+      uTime:   { value: 0 },
+    },
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    vertexShader: /* glsl */`
+      varying vec2 vUv;
+      varying vec3 vDir;
+      void main() {
+        vUv = uv;
+        vec4 world = modelMatrix * vec4(position, 1.0);
+        vDir = normalize(world.xyz - cameraPosition);
+        gl_Position = projectionMatrix * viewMatrix * world;
+      }
+    `,
+    fragmentShader: /* glsl */`
+      precision highp float;
+      uniform vec3 uSunDir, uWarm, uCool, uGlow;
+      uniform float uTime;
+      varying vec2 vUv;
+      varying vec3 vDir;
+
+      float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+      float noise(vec2 p){
+        vec2 i = floor(p), f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+                   mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+      }
+      float fbm(vec2 p){
+        float v = 0.0, a = 0.5;
+        for (int i = 0; i < 5; i++) { v += a * noise(p); p *= 2.07; a *= 0.5; }
+        return v;
+      }
+
+      void main() {
+        vec2 q = vec2(vUv.x * 4.0 + uTime * 0.004, vUv.y * 26.0);
+        float n = fbm(q);
+        float a = smoothstep(0.50, 0.86, n) * 0.55;
+
+        // fade out toward the edges of the sheet so it has no visible border
+        vec2 c = (vUv - 0.5) * 2.0;
+        a *= 1.0 - smoothstep(0.35, 0.98, length(c));
+
+        float sd = max(dot(vDir, uSunDir), 0.0);
+        vec3 col = mix(uCool, uWarm, pow(sd, 1.5));
+        col += uGlow * pow(sd, 10.0) * 0.7;
+
+        gl_FragColor = vec4(col, a);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(9000, 9000, 1, 1), mat);
+  m.rotation.x = Math.PI / 2;     // face down
+  m.position.y = 1150;
+  m.frustumCulled = false;
+  m.renderOrder = 5;
+  scene.add(m);
+  return mat;
+}
+const cirrusMat = buildCirrus();
+
+/* ══════════════════════════════════════════════════════════════════════
+   6. TERRAIN
+   ══════════════════════════════════════════════════════════════════════ */
+
+function terrainHeight(x, z) {
+  const r = Math.hypot(x, z);
+
+  // the hill itself: a broad gaussian dome
+  const dome = DOME_H * Math.exp(-(r * r) / (2 * HILL_R * HILL_R));
+
+  // rolling country, damped near the summit so the hill stays a clean shape
+  const far = smoothstep(70, 300, r);
+  const rolling = (fbm(x * 0.0030 + 11.3, z * 0.0030 + 4.7, 5) - 0.5) * 84 * far;
+  const detail  = (fbm(x * 0.016 + 3.1,  z * 0.016 + 9.2, 3) - 0.5) * 7.5;
+
+  let h = dome + rolling + detail * (0.35 + 0.65 * far);
+
+  // carve a flat plateau for the building to stand on, at the natural summit
+  const plat = smoothstep(78, 36, r);
+  h = h * (1 - plat) + PLATEAU_Y * plat;
+
+  // flatten toward the far horizon so the distance stays clean
+  h *= 1.0 - smoothstep(600, 2600, r) * 0.75;
+  return h;
+}
+
+// A polar grid rather than a square one: rings are packed near the middle and
+// stretch out toward the rim, so the hill gets fine detail while the mesh
+// still reaches the horizon in a single seamless surface.
+function buildTerrain() {
+  const RINGS = 230, SECT = 256, RMAX = 9000;
+  const count = RINGS * SECT;
+  const verts = new Float32Array(count * 3);
+
+  for (let i = 0; i < RINGS; i++) {
+    const u = (i + 0.4) / (RINGS - 1);
+    const r = RMAX * (0.10 * u + 0.90 * u * u * u);
+    for (let s = 0; s < SECT; s++) {
+      const a = (s / SECT) * Math.PI * 2;
+      const x = Math.cos(a) * r, z = Math.sin(a) * r;
+      const k = (i * SECT + s) * 3;
+      verts[k] = x; verts[k + 1] = terrainHeight(x, z); verts[k + 2] = z;
+    }
+  }
+
+  const idx = new Uint32Array((RINGS - 1) * SECT * 6);
+  let n = 0;
+  for (let i = 0; i < RINGS - 1; i++) {
+    for (let s = 0; s < SECT; s++) {
+      const s2 = (s + 1) % SECT;
+      const A = i * SECT + s, B = i * SECT + s2;
+      const C = (i + 1) * SECT + s, D = (i + 1) * SECT + s2;
+      idx[n++] = A; idx[n++] = B; idx[n++] = C;
+      idx[n++] = B; idx[n++] = D; idx[n++] = C;
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.computeVertexNormals();
+
+  const pos = geo.attributes.position;
+
+  // colour by slope and altitude
+  const nrm = geo.attributes.normal;
+  const colors = new Float32Array(pos.count * 3);
+  const grass = new THREE.Color(0x3c4526);
+  const dry   = new THREE.Color(0x60582f);
+  const rock  = new THREE.Color(0x554d43);
+  const low   = new THREE.Color(0x252c1c);
+  const tmp = new THREE.Color();
+
+  for (let i = 0; i < pos.count; i++) {
+    const y = pos.getY(i);
+    const slope = 1.0 - nrm.getY(i);                 // 0 flat .. 1 vertical
+    tmp.copy(low).lerp(grass, smoothstep(-6, 46, y));
+    tmp.lerp(dry, smoothstep(60, 120, y) * 0.7);
+    tmp.lerp(rock, smoothstep(0.16, 0.52, slope));
+    // subtle per-vertex mottling
+    const m = 0.86 + 0.28 * fbm(pos.getX(i) * 0.03, pos.getZ(i) * 0.03, 3);
+    colors[i * 3] = tmp.r * m; colors[i * 3 + 1] = tmp.g * m; colors[i * 3 + 2] = tmp.b * m;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const mat = new THREE.MeshStandardMaterial({
+    vertexColors: true, roughness: 0.97, metalness: 0.0,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.receiveShadow = true;
+  mesh.castShadow = true;
+  scene.add(mesh);
+}
+buildTerrain();
+
+/* ══════════════════════════════════════════════════════════════════════
+   7. BUILDINGS
+   ══════════════════════════════════════════════════════════════════════ */
+
+const matStone     = new THREE.MeshStandardMaterial({ color: 0xa2968a, roughness: 0.92 });
+const matStoneDark = new THREE.MeshStandardMaterial({ color: 0x7f7568, roughness: 0.95 });
+const matRoof      = new THREE.MeshStandardMaterial({ color: 0x4d3a42, roughness: 0.75 });
+const matWood      = new THREE.MeshStandardMaterial({ color: 0x4a3626, roughness: 0.9 });
+const matWindow    = new THREE.MeshStandardMaterial({
+  color: 0x241a12, emissive: 0xffab55, emissiveIntensity: 2.6, roughness: 1.0,
+});
+const matFlag      = new THREE.MeshStandardMaterial({
+  color: 0xa8323c, roughness: 0.85, side: THREE.DoubleSide,
+});
+
+function box(w, h, d, x, y, z, mat, ry) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z);
+  if (ry) m.rotation.y = ry;
+  return m;
+}
+function cyl(rt, rb, h, seg, x, y, z, mat) {
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(rt, rb, h, seg), mat);
+  m.position.set(x, y, z);
+  return m;
+}
+function cone(r, h, seg, x, y, z, mat, ry) {
+  const m = new THREE.Mesh(new THREE.ConeGeometry(r, h, seg), mat);
+  m.position.set(x, y, z);
+  if (ry) m.rotation.y = ry;
+  return m;
+}
+
+// merlons along the top edge of a wall run, as one instanced draw
+function crenellate(group, x0, z0, x1, z1, y, step, size, mat) {
+  const dx = x1 - x0, dz = z1 - z0;
+  const len = Math.hypot(dx, dz);
+  const n = Math.max(2, Math.floor(len / step));
+  const geo = new THREE.BoxGeometry(size, size * 1.15, size);
+  const inst = new THREE.InstancedMesh(geo, mat, n);
+  const m4 = new THREE.Matrix4();
+  const ang = Math.atan2(dx, dz);
+  for (let i = 0; i < n; i++) {
+    const t = (i + 0.5) / n;
+    m4.makeRotationY(ang);
+    m4.setPosition(
+      x0 + dx * t + (Math.random() - 0.5) * 0.25,
+      y + (Math.random() - 0.5) * 0.2,
+      z0 + dz * t + (Math.random() - 0.5) * 0.25,
+    );
+    inst.setMatrixAt(i, m4);
+  }
+  inst.instanceMatrix.needsUpdate = true;
+  group.add(inst);
+}
+
+function buildCastle() {
+  const g = new THREE.Group();
+  const y0 = PLATEAU_Y;
+
+  // rocky footing so nothing floats on the terrain
+  g.add(cyl(40, 46, 10, 20, 0, y0 - 4, 0, matStoneDark));
+
+  // curtain wall
+  const W = 33, wallH = 15, wallT = 3.4;
+  const walls = [
+    [0, -W, 2 * W, wallT], [0, W, 2 * W, wallT],
+    [-W, 0, wallT, 2 * W], [W, 0, wallT, 2 * W],
+  ];
+  for (const [x, z, sx, sz] of walls) {
+    g.add(box(sx, wallH, sz, x, y0 + wallH / 2, z, matStone));
+  }
+  crenellate(g, -W, -W,  W, -W, y0 + wallH + 1.0, 4.2, 1.7, matStone);
+  crenellate(g, -W,  W,  W,  W, y0 + wallH + 1.0, 4.2, 1.7, matStone);
+  crenellate(g, -W, -W, -W,  W, y0 + wallH + 1.0, 4.2, 1.7, matStone);
+  crenellate(g,  W, -W,  W,  W, y0 + wallH + 1.0, 4.2, 1.7, matStone);
+
+  // corner towers
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+    const tx = sx * W, tz = sz * W;
+    g.add(cyl(6.2, 7.0, 26, 14, tx, y0 + 13, tz, matStone));
+    g.add(cyl(7.4, 7.4, 2.2, 14, tx, y0 + 26.5, tz, matStoneDark));
+    g.add(cone(8.4, 14, 14, tx, y0 + 34.5, tz, matRoof));
+    g.add(box(1.1, 2.2, 1.1, tx + sx * 5.6, y0 + 18, tz + sz * 5.6, matWindow));
+  }
+
+  // gatehouse on the south wall
+  g.add(box(5, 19, 7, -6.5, y0 + 9.5, W, matStone));
+  g.add(box(5, 19, 7,  6.5, y0 + 9.5, W, matStone));
+  g.add(box(18, 5, 7, 0, y0 + 21.5, W, matStone));
+  g.add(box(9, 11, 1.2, 0, y0 + 5.5, W + 3.2, matWood));
+
+  // keep
+  const kw = 24, kd = 19, kh = 34;
+  g.add(box(kw, kh, kd, 0, y0 + kh / 2, -4, matStone));
+  g.add(box(kw + 2.6, 2.2, kd + 2.6, 0, y0 + kh + 1.1, -4, matStoneDark));
+  crenellate(g, -(kw / 2 + 1), -4 - (kd / 2 + 1),  (kw / 2 + 1), -4 - (kd / 2 + 1), y0 + kh + 3.2, 3.6, 1.6, matStone);
+  crenellate(g, -(kw / 2 + 1), -4 + (kd / 2 + 1),  (kw / 2 + 1), -4 + (kd / 2 + 1), y0 + kh + 3.2, 3.6, 1.6, matStone);
+  crenellate(g, -(kw / 2 + 1), -4 - (kd / 2 + 1), -(kw / 2 + 1), -4 + (kd / 2 + 1), y0 + kh + 3.2, 3.6, 1.6, matStone);
+  crenellate(g,  (kw / 2 + 1), -4 - (kd / 2 + 1),  (kw / 2 + 1), -4 + (kd / 2 + 1), y0 + kh + 3.2, 3.6, 1.6, matStone);
+
+  // keep windows
+  for (const lvl of [12, 21, 29]) {
+    for (const ox of [-7, 0, 7]) {
+      g.add(box(1.6, 3.0, 0.6, ox, y0 + lvl, -4 + kd / 2 + 0.1, matWindow));
+      g.add(box(1.6, 3.0, 0.6, ox, y0 + lvl, -4 - kd / 2 - 0.1, matWindow));
+    }
+  }
+
+  // stair turret
+  g.add(cyl(4.0, 4.4, 44, 12, kw / 2 - 1, y0 + 22, -4 - kd / 2 + 1, matStone));
+  g.add(cone(5.6, 11, 12, kw / 2 - 1, y0 + 49.5, -4 - kd / 2 + 1, matRoof));
+
+  // flag
+  const pole = cyl(0.28, 0.28, 13, 6, kw / 2 - 1, y0 + 61, -4 - kd / 2 + 1, matWood);
+  g.add(pole);
+  const flagGeo = new THREE.PlaneGeometry(9, 5.5, 12, 5);
+  flagGeo.translate(4.5, 0, 0);
+  const flag = new THREE.Mesh(flagGeo, matFlag);
+  flag.position.set(kw / 2 - 0.9, y0 + 65, -4 - kd / 2 + 1);
+  g.add(flag);
+  g.userData.flag = flag;
+
+  return g;
+}
+
+// triangular-prism gable roof, ridge running along +z
+function gableRoof(w, h, d) {
+  const hw = w / 2, hd = d / 2;
+  const v = [
+    // left slope
+    -hw, 0, -hd,   -hw, 0, hd,   0, h, hd,
+    -hw, 0, -hd,    0, h, hd,    0, h, -hd,
+    // right slope
+     hw, 0, hd,    hw, 0, -hd,   0, h, -hd,
+     hw, 0, hd,     0, h, -hd,   0, h, hd,
+    // gable ends
+    -hw, 0, -hd,    0, h, -hd,   hw, 0, -hd,
+    -hw, 0,  hd,   hw, 0,  hd,   0, h,  hd,
+  ];
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(v, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+function buildChurch() {
+  const g = new THREE.Group();
+  const y0 = PLATEAU_Y;
+
+  // footing, kept narrow and mostly buried so it does not read as a plate
+  g.add(cyl(24, 30, 12, 20, 0, y0 - 7, 0, matStoneDark));
+
+  // nave
+  const nw = 22, nh = 19, nd = 52;
+  g.add(box(nw, nh, nd, 0, y0 + nh / 2, 2, matStone));
+  const roof = new THREE.Mesh(gableRoof(nw + 1.8, 12, nd + 1.4), matRoof);
+  roof.position.set(0, y0 + nh, 2);
+  g.add(roof);
+
+  // side aisles
+  const ax = nw / 2 + 3;
+  for (const s of [-1, 1]) {
+    g.add(box(6, 10, nd - 6, s * ax, y0 + 5, 2, matStone));
+    const ar = new THREE.Mesh(gableRoof(6.8, 4.4, nd - 5.4), matRoof);
+    ar.position.set(s * ax, y0 + 10, 2);
+    g.add(ar);
+  }
+
+  // apse at the east end
+  g.add(cyl(10.5, 10.5, 15, 16, 0, y0 + 7.5, 2 - nd / 2 - 5, matStone));
+  g.add(cone(11.8, 9, 16, 0, y0 + 19.5, 2 - nd / 2 - 5, matRoof));
+
+  // buttresses
+  for (const s of [-1, 1]) {
+    for (let i = -2; i <= 2; i++) {
+      const bz = 2 + i * 10;
+      g.add(box(2.4, 12, 2.4, s * (nw / 2 + 6.6), y0 + 6, bz, matStoneDark));
+      const cap = box(2.4, 4.8, 2.4, s * (nw / 2 + 6.4), y0 + 13.5, bz, matStoneDark);
+      cap.rotation.z = s * 0.42;
+      g.add(cap);
+    }
+  }
+
+  // bell tower at the west end
+  const tw = 15, th = 52, tz = 2 + nd / 2 + 4.5;
+  g.add(box(tw, th, tw, 0, y0 + th / 2, tz, matStone));
+  g.add(box(tw + 1.8, 2.2, tw + 1.8, 0, y0 + th + 1.1, tz, matStoneDark));
+  // belfry openings
+  for (const s of [-1, 1]) {
+    g.add(box(4.0, 8, 0.8, s * 3.4, y0 + th - 10, tz + tw / 2 + 0.1, matStoneDark));
+    g.add(box(4.0, 8, 0.8, s * 3.4, y0 + th - 10, tz - tw / 2 - 0.1, matStoneDark));
+    g.add(box(0.8, 8, 4.0, s * (tw / 2 + 0.1), y0 + th - 10, tz + 3.4, matStoneDark));
+    g.add(box(0.8, 8, 4.0, s * (tw / 2 + 0.1), y0 + th - 10, tz - 3.4, matStoneDark));
+  }
+  // corner pinnacles + spire
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+    g.add(cone(1.7, 7.5, 4, sx * (tw / 2 - 0.4), y0 + th + 6, tz + sz * (tw / 2 - 0.4), matRoof, Math.PI / 4));
+  }
+  g.add(cone(11.0, 30, 4, 0, y0 + th + 15, tz, matRoof, Math.PI / 4));
+  g.add(box(0.5, 6.0, 0.5, 0, y0 + th + 33, tz, matStoneDark));
+  g.add(box(3.2, 0.5, 0.5, 0, y0 + th + 34, tz, matStoneDark));
+
+  // windows: lancets on the aisle walls, clerestory above the aisle roofs,
+  // rose window on the west face of the tower
+  for (const s of [-1, 1]) {
+    for (let i = -2; i <= 2; i++) {
+      g.add(box(0.6, 5.0, 2.2, s * (ax + 3.1), y0 + 5.5, 2 + i * 9, matWindow));
+      g.add(box(0.6, 4.5, 2.6, s * (nw / 2 + 0.1), y0 + 14.0, 2 + i * 9, matWindow));
+    }
+  }
+  const rose = new THREE.Mesh(new THREE.CircleGeometry(4.4, 24), matWindow);
+  rose.position.set(0, y0 + th - 30, tz + tw / 2 + 0.12);
+  g.add(rose);
+  g.add(box(6.0, 10, 1.0, 0, y0 + 5, tz + tw / 2 + 0.1, matWood));
+
+  return g;
+}
+
+function setShadows(root) {
+  root.traverse(o => {
+    if (o.isMesh || o.isInstancedMesh) { o.castShadow = true; o.receiveShadow = true; }
+  });
+}
+
+const castle = buildCastle();
+const church = buildChurch();
+setShadows(castle);
+setShadows(church);
+scene.add(castle, church);
+church.visible = false;
+let showingCastle = true;
+
+/* ══════════════════════════════════════════════════════════════════════
+   8. LIGHTING
+   ══════════════════════════════════════════════════════════════════════ */
+
+const sun = new THREE.DirectionalLight(0xffb375, 2.4);
+sun.position.copy(SUN_DIR).multiplyScalar(1400);
+sun.target.position.set(0, PLATEAU_Y, 0);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+sun.shadow.camera.left = -1100;
+sun.shadow.camera.right = 1100;
+sun.shadow.camera.top = 1100;
+sun.shadow.camera.bottom = -1100;
+sun.shadow.camera.near = 300;
+sun.shadow.camera.far = 2700;
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.4;
+scene.add(sun, sun.target);
+
+scene.add(new THREE.HemisphereLight(0x6d7fbe, 0x54402f, 0.45));
+scene.add(new THREE.AmbientLight(0x394463, 0.22));
+
+/* ══════════════════════════════════════════════════════════════════════
+   9. GPGPU FLOCKING
+   ══════════════════════════════════════════════════════════════════════ */
+
+const computeScene = new THREE.Scene();
+const computeCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const computeQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), null);
+computeQuad.frustumCulled = false;
+computeScene.add(computeQuad);
+
+const COMPUTE_VS = /* glsl */`
+  void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }
+`;
+
+const COPY_FS = /* glsl */`
+  precision highp float;
+  uniform sampler2D uSrc;
+  uniform float uRes;
+  void main() { gl_FragColor = texture2D(uSrc, gl_FragCoord.xy / uRes); }
+`;
+
+const VELOCITY_FS = /* glsl */`
+  precision highp float;
+
+  uniform sampler2D texturePosition;
+  uniform sampler2D textureVelocity;
+  uniform float uRes, uTotal, uStride, uOffset, uComp;
+  uniform float uDt, uTime;
+  uniform float uSepDist, uAliDist, uCohDist;
+  uniform float uSepW, uAliW, uCohW;
+  uniform vec3  uRoost;
+  uniform vec3  uPredator;
+  uniform float uPredatorOn;
+  uniform float uMinSpeed, uMaxSpeed, uMaxTurn;
+  uniform float uFloorBase, uFloorDome, uHillR, uCeil;
+  uniform vec3  uWind;
+
+  vec2 uvFor(float idx) {
+    float y = floor(idx / uRes);
+    float x = idx - y * uRes;
+    return (vec2(x, y) + 0.5) / uRes;
+  }
+
+  void main() {
+    vec2 uv = gl_FragCoord.xy / uRes;
+    vec4 P = texture2D(texturePosition, uv);
+    vec4 V = texture2D(textureVelocity, uv);
+    vec3 pos = P.xyz;
+    vec3 vel = V.xyz;
+
+    float speed = max(length(vel), 0.0001);
+    vec3 fwd = vel / speed;
+
+    float myIdx = floor(gl_FragCoord.y) * uRes + floor(gl_FragCoord.x);
+
+    float sepD2 = uSepDist * uSepDist;
+    float aliD2 = uAliDist * uAliDist;
+    float cohD2 = uCohDist * uCohDist;
+
+    vec3 sep = vec3(0.0);
+    vec3 ali = vec3(0.0);
+    vec3 coh = vec3(0.0);
+    float aliN = 0.0, cohN = 0.0;
+
+    // Each bird walks a strided ring through the population. The stride is
+    // coprime with the population size, so the walk covers the whole flock,
+    // and uOffset rotates the starting point every frame - over a handful of
+    // frames every bird effectively sees everyone. Sums are scaled by uComp
+    // (population / samples) to stay unbiased.
+    float base = myIdx + uOffset;
+
+    for (int i = 0; i < SAMPLES; i++) {
+      float idx = mod(base + float(i) * uStride, uTotal);
+      vec2 ouv = uvFor(floor(idx));
+      vec3 opos = texture2D(texturePosition, ouv).xyz;
+
+      vec3 d = opos - pos;
+      float d2 = dot(d, d);
+
+      if (d2 < cohD2 && d2 > 1e-5) {
+        float dist = sqrt(d2);
+        vec3 dir = d / dist;
+
+        // birds cannot see behind themselves
+        if (dot(dir, fwd) > -0.4) {
+          if (d2 < sepD2) {
+            sep -= dir * (1.0 - dist / uSepDist);
+          }
+          if (d2 < aliD2) {
+            ali += texture2D(textureVelocity, ouv).xyz;
+            aliN += 1.0;
+          }
+          coh += opos;
+          cohN += 1.0;
+        }
+      }
+    }
+
+    vec3 acc = vec3(0.0);
+
+    // separation - the only short-range force, and the one that keeps the
+    // flock looking incompressible
+    vec3 sepSum = sep * uComp;
+    float sepMag = length(sepSum);
+    if (sepMag > 1e-4) {
+      vec3 desired = (sepSum / sepMag) * uMaxSpeed;
+      acc += (desired - vel) * uSepW * min(sepMag * 0.30, 2.0);
+    }
+
+    // alignment
+    if (aliN > 0.0) {
+      vec3 avg = ali / aliN;
+      float m = length(avg);
+      if (m > 1e-4) acc += ((avg / m) * uMaxSpeed - vel) * uAliW;
+    }
+
+    // cohesion
+    if (cohN > 0.0) {
+      vec3 toCentre = coh / cohN - pos;
+      float m = length(toCentre);
+      if (m > 1e-4) {
+        acc += ((toCentre / m) * uMaxSpeed - vel) * uCohW * min(m / uCohDist, 1.0);
+      }
+    }
+
+    // Roost: a weak leash that firms up once a bird strays. The vertical
+    // component is weighted heavily, which squashes the flock into the wide,
+    // shallow sheet a real murmuration forms rather than a ball.
+    vec3 toRoost = uRoost - pos;
+    vec3 leash = vec3(toRoost.x, toRoost.y * 3.2, toRoost.z);
+    float rd = length(leash);
+    if (rd > 1e-3) {
+      float pull = 0.10 + 2.4 * smoothstep(130.0, 300.0, rd);
+      acc += ((leash / rd) * uMaxSpeed - vel) * pull;
+    }
+
+    // A slowly evolving flow field. Boid rules alone give an evenly grained
+    // blob; this is what breaks it into the lobes, filaments and eddies that
+    // make a murmuration read as alive.
+    vec3 q = pos * 0.0075;
+    vec3 turb = vec3(
+      sin(q.y * 1.7 + uTime * 0.33) * cos(q.z * 1.3 - uTime * 0.21),
+      sin(q.z * 1.5 + uTime * 0.27) * cos(q.x * 1.1 + uTime * 0.17) * 0.40,
+      sin(q.x * 1.9 - uTime * 0.23) * cos(q.y * 1.6 + uTime * 0.19)
+    );
+    turb += 0.55 * vec3(
+      sin(q.z * 4.1 - uTime * 0.61),
+      sin(q.x * 3.7 + uTime * 0.53) * 0.35,
+      sin(q.y * 4.3 + uTime * 0.47)
+    );
+    acc += turb * uMaxSpeed * 1.15;
+
+    // predator
+    if (uPredatorOn > 0.5) {
+      vec3 away = pos - uPredator;
+      float pd = length(away);
+      float pr = 78.0;
+      if (pd < pr && pd > 1e-3) {
+        float f = pow(1.0 - pd / pr, 2.0);
+        vec3 esc = normalize(away + vec3(0.0, 0.30, 0.0));
+        acc += (esc * uMaxSpeed - vel) * f * 22.0;
+      }
+    }
+
+    // ground: a dome-shaped floor that lifts over the hill, so birds can dip
+    // low out on the plain but never clip the castle
+    float rxz2 = dot(pos.xz, pos.xz);
+    float floorY = uFloorBase + uFloorDome * exp(-rxz2 / (2.0 * uHillR * uHillR));
+    if (pos.y < floorY) acc.y += (floorY - pos.y) * 3.2;
+    if (pos.y > uCeil)  acc.y -= (pos.y - uCeil) * 3.2;
+
+    acc += uWind;
+
+    // integrate with a turn-rate limit, so heading changes are arcs not snaps
+    vel += acc * uDt;
+    float ns = length(vel);
+    if (ns < 1e-4) {
+      vel = fwd * uMinSpeed;
+    } else {
+      vec3 nd = vel / ns;
+      float c = clamp(dot(nd, fwd), -1.0, 1.0);
+      float ang = acos(c);
+      float maxAng = uMaxTurn * uDt;
+      if (ang > maxAng && ang > 1e-5) nd = normalize(mix(fwd, nd, maxAng / ang));
+      vel = nd * clamp(ns, uMinSpeed, uMaxSpeed);
+    }
+
+    // signed lateral acceleration drives the visual bank, smoothed over time
+    vec3 right = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)) + vec3(1e-6, 0.0, 0.0));
+    float bank = clamp(dot(acc, right) / uMaxSpeed, -1.0, 1.0);
+    bank = mix(V.w, bank, 0.10);
+
+    gl_FragColor = vec4(vel, bank);
+  }
+`;
+
+const POSITION_FS = /* glsl */`
+  precision highp float;
+  uniform sampler2D texturePosition;
+  uniform sampler2D textureVelocity;
+  uniform float uRes, uDt;
+
+  void main() {
+    vec2 uv = gl_FragCoord.xy / uRes;
+    vec4 P = texture2D(texturePosition, uv);
+    vec3 vel = texture2D(textureVelocity, uv).xyz;
+    vec3 pos = P.xyz + vel * uDt;
+    float phase = P.w + uDt * (7.0 + length(vel) * 0.30);
+    gl_FragColor = vec4(pos, mod(phase, 6.2831853));
+  }
+`;
+
+const BIRD_VS = /* glsl */`
+  attribute vec2 reference;
+  attribute float wingFlag;
+
+  uniform sampler2D texturePosition;
+  uniform sampler2D textureVelocity;
+  uniform float uScale;
+
+  varying vec3 vNormal;
+  varying float vFogDepth;
+
+  void main() {
+    vec4 P = texture2D(texturePosition, reference);
+    vec4 V = texture2D(textureVelocity, reference);
+
+    vec3 bp = P.xyz;
+    float phase = P.w;
+    vec3 vel = V.xyz;
+    float bank = V.w;
+
+    vec3 f = normalize(vel + vec3(0.0, 0.0, 1e-5));
+    vec3 upRef = abs(f.y) > 0.98 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+    vec3 r = normalize(cross(f, upRef));
+    vec3 u = cross(r, f);
+
+    // roll into the turn
+    float roll = clamp(bank * 2.2, -1.0, 1.0) * 1.15;
+    float cr = cos(roll), sr = sin(roll);
+    vec3 r2 = r * cr + u * sr;
+    vec3 u2 = u * cr - r * sr;
+
+    vec3 p = position;
+    vec3 n = normal;
+    if (wingFlag > 0.5) {
+      // rotate each wing about the body axis; sign(x) makes both beat together
+      float a = sin(phase) * 0.95 * sign(p.x);
+      float ca = cos(a), sa = sin(a);
+      p = vec3(p.x * ca - p.y * sa, p.x * sa + p.y * ca, p.z);
+      n = vec3(n.x * ca - n.y * sa, n.x * sa + n.y * ca, n.z);
+    }
+    p *= uScale;
+
+    vec3 world = bp + r2 * p.x + u2 * p.y + f * p.z;
+    vNormal = normalize(r2 * n.x + u2 * n.y + f * n.z);
+
+    vec4 mv = viewMatrix * vec4(world, 1.0);
+    vFogDepth = -mv.z;
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+
+const BIRD_FS = /* glsl */`
+  precision highp float;
+  uniform vec3 uSunDir, uDark, uLit, uFogCol;
+  uniform float uFogDen;
+  varying vec3 vNormal;
+  varying float vFogDepth;
+
+  void main() {
+    vec3 n = normalize(vNormal);
+    float ndl = dot(n, uSunDir);
+    // backlit: mostly silhouette, with a little warmth where the sun catches
+    vec3 col = mix(uDark, uLit, smoothstep(-0.10, 0.98, ndl) * 0.55);
+    float f = 1.0 - exp(-uFogDen * uFogDen * vFogDepth * vFogDepth);
+    col = mix(col, uFogCol, f);
+    gl_FragColor = vec4(col, 1.0);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+  }
+`;
+
+function gcd(a, b) { while (b) { const t = a % b; a = b; b = t; } return a; }
+
+const flock = {
+  width: 0, count: 0, samples: 0,
+  posRT: [null, null], velRT: [null, null], cur: 0,
+  velMat: null, posMat: null, copyMat: null,
+  mesh: null, birdMat: null,
+  roost: new THREE.Vector3(0, CFG.roostY, 0),
+};
+
+function makeRT(w) {
+  return new THREE.WebGLRenderTarget(w, w, {
+    wrapS: THREE.ClampToEdgeWrapping,
+    wrapT: THREE.ClampToEdgeWrapping,
+    minFilter: THREE.NearestFilter,
+    magFilter: THREE.NearestFilter,
+    format: THREE.RGBAFormat,
+    type: DATA_TYPE,
+    depthBuffer: false,
+    stencilBuffer: false,
+  });
+}
+
+function runPass(material, target) {
+  computeQuad.material = material;
+  renderer.setRenderTarget(target);
+  renderer.render(computeScene, computeCam);
+  renderer.setRenderTarget(null);
+}
+
+function birdGeometry(width) {
+  const count = width * width;
+  const g = new THREE.InstancedBufferGeometry();
+
+  const V = [], N = [], F = [];
+  const tri = (a, b, c, flag) => {
+    V.push(...a, ...b, ...c);
+    N.push(0, 1, 0, 0, 1, 0, 0, 1, 0);
+    F.push(flag, flag, flag);
+  };
+  // body (nose toward +z), tail, and two wings
+  tri([0, 0, 1.15], [-0.17, 0, -0.45], [0.17, 0, -0.45], 0);
+  tri([-0.17, 0, -0.45], [0.17, 0, -0.45], [0, 0.02, -1.35], 0);
+  tri([0, 0, 0.45], [0, 0, -0.55], [-1.55, 0, -0.20], 1);
+  tri([0, 0, -0.55], [0, 0, 0.45], [1.55, 0, -0.20], 1);
+
+  g.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
+  g.setAttribute('wingFlag', new THREE.Float32BufferAttribute(F, 1));
+
+  const refs = new Float32Array(count * 2);
+  for (let i = 0; i < count; i++) {
+    refs[i * 2]     = ((i % width) + 0.5) / width;
+    refs[i * 2 + 1] = (Math.floor(i / width) + 0.5) / width;
+  }
+  g.setAttribute('reference', new THREE.InstancedBufferAttribute(refs, 2));
+  g.instanceCount = count;
+  return g;
+}
+
+function initFlock(width) {
+  // tear down any previous flock
+  if (flock.mesh) {
+    scene.remove(flock.mesh);
+    flock.mesh.geometry.dispose();
+    flock.birdMat.dispose();
+    flock.velMat.dispose();
+    flock.posMat.dispose();
+    flock.copyMat.dispose();
+    flock.posRT.forEach(rt => rt && rt.dispose());
+    flock.velRT.forEach(rt => rt && rt.dispose());
+  }
+
+  const count = width * width;
+  const samples = Math.min(CFG.samples, count);
+  let stride = Math.max(1, Math.round(count / samples));
+  while (gcd(stride, count) !== 1) stride++;      // must walk the whole ring
+
+  flock.width = width;
+  flock.count = count;
+  flock.samples = samples;
+  flock.stride = stride;
+
+  // ---- initial state -------------------------------------------------
+  const pd = new Float32Array(count * 4);
+  const vd = new Float32Array(count * 4);
+  const R = 90;
+  for (let i = 0; i < count; i++) {
+    let x, y, z, d2;
+    do {
+      x = Math.random() * 2 - 1; y = Math.random() * 2 - 1; z = Math.random() * 2 - 1;
+      d2 = x * x + y * y + z * z;
+    } while (d2 > 1);
+    pd[i * 4]     = x * R;
+    pd[i * 4 + 1] = CFG.roostY + y * R * 0.55;
+    pd[i * 4 + 2] = z * R;
+    pd[i * 4 + 3] = Math.random() * Math.PI * 2;
+
+    const a = Math.random() * Math.PI * 2, e = (Math.random() - 0.5) * 0.5;
+    const s = CFG.minSpeed + Math.random() * (CFG.maxSpeed - CFG.minSpeed);
+    vd[i * 4]     = Math.cos(a) * Math.cos(e) * s;
+    vd[i * 4 + 1] = Math.sin(e) * s;
+    vd[i * 4 + 2] = Math.sin(a) * Math.cos(e) * s;
+    vd[i * 4 + 3] = 0;
+  }
+  const posSeed = new THREE.DataTexture(pd, width, width, THREE.RGBAFormat, THREE.FloatType);
+  const velSeed = new THREE.DataTexture(vd, width, width, THREE.RGBAFormat, THREE.FloatType);
+  posSeed.needsUpdate = velSeed.needsUpdate = true;
+
+  flock.posRT = [makeRT(width), makeRT(width)];
+  flock.velRT = [makeRT(width), makeRT(width)];
+  flock.cur = 0;
+
+  flock.copyMat = new THREE.ShaderMaterial({
+    uniforms: { uSrc: { value: null }, uRes: { value: width } },
+    vertexShader: COMPUTE_VS, fragmentShader: COPY_FS,
+    depthTest: false, depthWrite: false,
+  });
+  flock.copyMat.uniforms.uSrc.value = posSeed;
+  runPass(flock.copyMat, flock.posRT[0]);
+  runPass(flock.copyMat, flock.posRT[1]);
+  flock.copyMat.uniforms.uSrc.value = velSeed;
+  runPass(flock.copyMat, flock.velRT[0]);
+  runPass(flock.copyMat, flock.velRT[1]);
+  posSeed.dispose();
+  velSeed.dispose();
+
+  // ---- compute materials ---------------------------------------------
+  flock.velMat = new THREE.ShaderMaterial({
+    defines: { SAMPLES: samples },
+    uniforms: {
+      texturePosition: { value: null },
+      textureVelocity: { value: null },
+      uRes:    { value: width },
+      uTotal:  { value: count },
+      uStride: { value: stride },
+      uOffset: { value: 0 },
+      uComp:   { value: count / samples },
+      uDt:     { value: 0 },
+      uTime:   { value: 0 },
+      uSepDist: { value: CFG.sepDist },
+      uAliDist: { value: CFG.aliDist },
+      uCohDist: { value: CFG.coh1Dist },
+      uSepW:   { value: CFG.sepW },
+      uAliW:   { value: CFG.aliW },
+      uCohW:   { value: CFG.cohW },
+      uRoost:  { value: flock.roost },
+      uPredator: { value: predator.pos },
+      uPredatorOn: { value: CFG.predator ? 1 : 0 },
+      uMinSpeed: { value: CFG.minSpeed },
+      uMaxSpeed: { value: CFG.maxSpeed },
+      uMaxTurn:  { value: CFG.maxTurn },
+      uFloorBase: { value: CFG.floorBase },
+      uFloorDome: { value: CFG.floorDome },
+      uHillR:  { value: HILL_R },
+      uCeil:   { value: CFG.ceil },
+      uWind:   { value: new THREE.Vector3(0.9, 0.0, -0.5) },
+    },
+    vertexShader: COMPUTE_VS, fragmentShader: VELOCITY_FS,
+    depthTest: false, depthWrite: false,
+  });
+
+  flock.posMat = new THREE.ShaderMaterial({
+    uniforms: {
+      texturePosition: { value: null },
+      textureVelocity: { value: null },
+      uRes: { value: width },
+      uDt:  { value: 0 },
+    },
+    vertexShader: COMPUTE_VS, fragmentShader: POSITION_FS,
+    depthTest: false, depthWrite: false,
+  });
+
+  // ---- render material -----------------------------------------------
+  flock.birdMat = new THREE.ShaderMaterial({
+    uniforms: {
+      texturePosition: { value: null },
+      textureVelocity: { value: null },
+      uScale:  { value: CFG.birdScale },
+      uSunDir: { value: SUN_DIR },
+      uDark:   { value: COL.birdDark },
+      uLit:    { value: COL.birdLit },
+      uFogCol: { value: COL.fog },
+      uFogDen: { value: FOG_DENSITY },
+    },
+    vertexShader: BIRD_VS, fragmentShader: BIRD_FS,
+    side: THREE.DoubleSide,
+  });
+
+  flock.mesh = new THREE.Mesh(birdGeometry(width), flock.birdMat);
+  flock.mesh.frustumCulled = false;
+  scene.add(flock.mesh);
+}
+
+function stepFlock(dt, time) {
+  const cur = flock.cur, next = 1 - cur;
+
+  const vu = flock.velMat.uniforms;
+  vu.texturePosition.value = flock.posRT[cur].texture;
+  vu.textureVelocity.value = flock.velRT[cur].texture;
+  vu.uDt.value = dt;
+  vu.uTime.value = time;
+  vu.uOffset.value = Math.floor(time * 977.0) % flock.count;
+  runPass(flock.velMat, flock.velRT[next]);
+
+  const pu = flock.posMat.uniforms;
+  pu.texturePosition.value = flock.posRT[cur].texture;
+  pu.textureVelocity.value = flock.velRT[next].texture;
+  pu.uDt.value = dt;
+  runPass(flock.posMat, flock.posRT[next]);
+
+  flock.cur = next;
+  flock.birdMat.uniforms.texturePosition.value = flock.posRT[next].texture;
+  flock.birdMat.uniforms.textureVelocity.value = flock.velRT[next].texture;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   10. PREDATOR
+   ══════════════════════════════════════════════════════════════════════ */
+
+const predator = {
+  pos: new THREE.Vector3(0, CFG.roostY, 200),
+  prev: new THREE.Vector3(0, CFG.roostY, 200),
+  mesh: null,
+};
+
+function buildPredator() {
+  const V = [], N = [];
+  const tri = (a, b, c) => { V.push(...a, ...b, ...c); N.push(0, 1, 0, 0, 1, 0, 0, 1, 0); };
+  tri([0, 0, 2.0], [-0.4, 0, -0.9], [0.4, 0, -0.9]);
+  tri([-0.4, 0, -0.9], [0.4, 0, -0.9], [0, 0.05, -2.6]);
+  tri([0, 0, 0.9], [0, 0, -1.1], [-3.2, 0.25, -0.9]);
+  tri([0, 0, -1.1], [0, 0, 0.9], [3.2, 0.25, -0.9]);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(V, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
+  const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+    color: 0x1a1620, roughness: 1.0, side: THREE.DoubleSide,
+  }));
+  m.scale.setScalar(2.3);
+  scene.add(m);
+  predator.mesh = m;
+}
+buildPredator();
+
+function updatePredator(time) {
+  predator.prev.copy(predator.pos);
+  // an orbit whose radius breathes from wide sweeps down through the flock
+  const T = time * 0.44;
+  const rad = 26 + 145 * (0.5 + 0.5 * Math.cos(T * 0.47));
+  predator.pos.set(
+    flock.roost.x + Math.cos(T) * rad,
+    flock.roost.y + Math.sin(T * 0.73) * 48,
+    flock.roost.z + Math.sin(T) * rad,
+  );
+  predator.mesh.visible = CFG.predator;
+  if (!CFG.predator) return;
+  predator.mesh.position.copy(predator.pos);
+  const look = predator.pos.clone().add(
+    predator.pos.clone().sub(predator.prev).setLength(10),
+  );
+  predator.mesh.lookAt(look);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   11. CAMERA RIG
+   ══════════════════════════════════════════════════════════════════════ */
+
+const rig = {
+  // opening on the sun: the camera sits opposite SUN_DIR so the flock and the
+  // castle are backlit from the first frame
+  azimuth: Math.atan2(-SUN_DIR.x, -SUN_DIR.z),
+  elevation: 0.15,
+  radius: 345,
+  target: new THREE.Vector3(0, 195, 0),
+  manual: false,
+  idleAt: 0,
+  drag: null,
+};
+
+const canvas = renderer.domElement;
+canvas.addEventListener('pointerdown', e => {
+  rig.drag = { x: e.clientX, y: e.clientY };
+  rig.manual = true;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!rig.drag) return;
+  rig.azimuth   -= (e.clientX - rig.drag.x) * 0.0042;
+  rig.elevation = THREE.MathUtils.clamp(
+    rig.elevation + (e.clientY - rig.drag.y) * 0.0028, -0.05, 0.92);
+  rig.drag.x = e.clientX; rig.drag.y = e.clientY;
+});
+const endDrag = () => { if (rig.drag) { rig.drag = null; rig.idleAt = performance.now(); } };
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  rig.radius = THREE.MathUtils.clamp(rig.radius * (1 + Math.sign(e.deltaY) * 0.08), 110, 900);
+  rig.manual = true;
+  rig.idleAt = performance.now();
+}, { passive: false });
+
+function updateCamera(dt, time) {
+  if (rig.manual && !rig.drag && performance.now() - rig.idleAt > 4000) rig.manual = false;
+
+  if (!rig.manual) {
+    rig.azimuth += dt * 0.062 * CFG.orbitSpeed;
+    // ease back to the framing the auto-orbit wants
+    rig.elevation += (0.16 + Math.sin(time * 0.077) * 0.08 - rig.elevation) * dt * 0.6;
+    rig.radius += (345 + Math.sin(time * 0.043) * 55 - rig.radius) * dt * 0.6;
+  }
+
+  // keep both the building and the drifting flock in frame
+  const want = new THREE.Vector3(
+    flock.roost.x * 0.35,
+    PLATEAU_Y + 22 + (flock.roost.y - PLATEAU_Y) * 0.40,
+    flock.roost.z * 0.35,
+  );
+  rig.target.lerp(want, 1 - Math.exp(-dt * 0.7));
+
+  const ce = Math.cos(rig.elevation), se = Math.sin(rig.elevation);
+  camera.position.set(
+    rig.target.x + Math.sin(rig.azimuth) * rig.radius * ce,
+    rig.target.y + se * rig.radius,
+    rig.target.z + Math.cos(rig.azimuth) * rig.radius * ce,
+  );
+  camera.lookAt(rig.target);
+  sky.position.copy(camera.position);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   12. POST PROCESSING
+   ══════════════════════════════════════════════════════════════════════ */
+
+let composer = null, bloomPass = null;
+try {
+  const [{ EffectComposer }, { RenderPass }, { UnrealBloomPass }, { OutputPass }] =
+    await Promise.all([
+      import('three/addons/postprocessing/EffectComposer.js'),
+      import('three/addons/postprocessing/RenderPass.js'),
+      import('three/addons/postprocessing/UnrealBloomPass.js'),
+      import('three/addons/postprocessing/OutputPass.js'),
+    ]);
+  composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight), 0.50, 0.50, 0.86);
+  composer.addPass(bloomPass);
+  composer.addPass(new OutputPass());
+  composer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  composer.setSize(window.innerWidth, window.innerHeight);
+} catch (err) {
+  console.warn('post-processing unavailable, rendering direct:', err);
+  CFG.bloom = false;
+  const cb = document.getElementById('bloom');
+  cb.checked = false; cb.disabled = true;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   13. UI
+   ══════════════════════════════════════════════════════════════════════ */
+
+const $ = id => document.getElementById(id);
+const ui = $('ui'), stats = $('stats'), hint = $('hint');
+
+function bindSlider(id, label, apply) {
+  const el = $(id), out = $('v-' + id);
+  const sync = () => {
+    const v = parseFloat(el.value);
+    out.textContent = v.toFixed(2);
+    apply(v);
+  };
+  el.addEventListener('input', sync);
+  sync();
+}
+
+bindSlider('sep', 'Separation', v => { CFG.sepW = v; if (flock.velMat) flock.velMat.uniforms.uSepW.value = v; });
+bindSlider('ali', 'Alignment',  v => { CFG.aliW = v; if (flock.velMat) flock.velMat.uniforms.uAliW.value = v; });
+bindSlider('coh', 'Cohesion',   v => { CFG.cohW = v; if (flock.velMat) flock.velMat.uniforms.uCohW.value = v; });
+bindSlider('orb', 'Orbit',      v => { CFG.orbitSpeed = v; });
+
+$('tier').addEventListener('change', e => {
+  CFG.tier = parseInt(e.target.value, 10);
+  initFlock(CFG.tier);
+  syncTierLabel();
+});
+function syncTierLabel() {
+  $('v-tier').textContent = flock.count.toLocaleString();
+}
+
+$('pred').addEventListener('change', e => {
+  CFG.predator = e.target.checked;
+  if (flock.velMat) flock.velMat.uniforms.uPredatorOn.value = CFG.predator ? 1 : 0;
+});
+$('bloom').addEventListener('change', e => { CFG.bloom = e.target.checked && !!composer; });
+
+function toggleBuilding() {
+  showingCastle = !showingCastle;
+  castle.visible = showingCastle;
+  church.visible = !showingCastle;
+}
+
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'h') { ui.classList.toggle('open'); hint.classList.add('faded'); }
+  else if (k === 'b') toggleBuilding();
+  else if (k === 'p') CFG.paused = !CFG.paused;
+});
+
+setTimeout(() => hint.classList.add('faded'), 9000);
+
+function bail(msg) {
+  const f = document.getElementById('fail');
+  f.style.display = 'grid';
+  f.textContent = msg;
+  throw new Error(msg);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   14. LOOP
+   ══════════════════════════════════════════════════════════════════════ */
+
+initFlock(CFG.tier);
+syncTierLabel();
+
+const clock = new THREE.Clock();
+let time = 0, fpsAcc = 0, fpsFrames = 0, fpsShown = 0;
+
+// per-vertex flag wave, cheap enough on the CPU for a 12x5 plane
+const flagMesh = castle.userData.flag;
+const flagBase = flagMesh.geometry.attributes.position.array.slice();
+
+function animate() {
+  const dt = Math.min(clock.getDelta(), 1 / 20);
+  time += dt;
+
+  fpsAcc += dt; fpsFrames++;
+  if (fpsAcc > 0.5) {
+    fpsShown = Math.round(fpsFrames / fpsAcc);
+    fpsAcc = 0; fpsFrames = 0;
+    stats.textContent = `${fpsShown} fps · ${flock.count.toLocaleString()} birds · ` +
+      `${flock.samples} neighbours/frame`;
+  }
+
+  if (!CFG.paused) {
+    // the roost wanders on a slow lissajous above the hilltop
+    flock.roost.set(
+      Math.sin(time * 0.052) * CFG.roostSwing,
+      CFG.roostY + Math.sin(time * 0.083) * 26,
+      Math.cos(time * 0.037) * CFG.roostSwing,
+    );
+    updatePredator(time);
+    stepFlock(dt, time);
+
+    cloudGroup.rotation.y = time * 0.0032;
+    cirrusMat.uniforms.uTime.value = time;
+
+    if (castle.visible) {
+      const a = flagMesh.geometry.attributes.position;
+      for (let i = 0; i < a.count; i++) {
+        const x = flagBase[i * 3], y = flagBase[i * 3 + 1];
+        a.setZ(i, Math.sin(x * 0.9 - time * 5.0) * 0.42 * (x / 9) +
+                  Math.sin(y * 1.6 + time * 3.1) * 0.16 * (x / 9));
+      }
+      a.needsUpdate = true;
+    }
+  }
+
+  updateCamera(dt, time);
+
+  if (CFG.bloom && composer) composer.render();
+  else renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(animate);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  if (composer) {
+    composer.setSize(window.innerWidth, window.innerHeight);
+    if (bloomPass) bloomPass.setSize(window.innerWidth, window.innerHeight);
+  }
+});
+</script>
+</body>
+</html>
