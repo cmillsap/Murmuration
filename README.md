@@ -3,12 +3,19 @@
 A WebGL scene: a murmuration of thousands of starlings wheeling over a hilltop castle
 at sunset. One self-contained HTML file, no build step.
 
+**[See it running →](https://cmillsap.github.io/Murmuration/)**
+
+![Thousands of starlings wheeling in front of the setting sun, above a castle
+silhouetted on a hilltop](screenshot.jpg)
+
 Built with three.js r160.
 
 ## Running it
 
-Double-click `index.html`. It pulls three.js from a CDN, so it needs an internet
-connection but nothing else.
+It's live at [cmillsap.github.io/Murmuration](https://cmillsap.github.io/Murmuration/).
+
+To run it locally, double-click `index.html`. It pulls three.js from a CDN, so it
+needs an internet connection but nothing else.
 
 If your browser refuses the module import over `file://`, serve the folder instead:
 
